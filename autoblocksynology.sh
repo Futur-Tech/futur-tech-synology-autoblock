@@ -1,5 +1,16 @@
 #!/bin/sh
 
+export LOG_FILE="/var/log/futur-tech-relay-server.log"
+source /usr/local/etc/futur-tech-relay-server.conf
+source /usr/local/bin/futur-tech-relay-server/ft_util_inc_var
+
+if [ "$(whoami)" != "root" ] ; then $S_LOG -s crit -d $S_NAME "Please run as root! You are only \"$(whoami)\"." ; exit 2 ; fi
+if [ -z "$1" ] ; then
+    $S_LOG -s crit -d $S_NAME "\$1 is empty..." ; echo "Usage: $0 <client-hostname>" ; exit 1
+else
+    client_host="$1"
+fi
+
 ###############################################################################
 ###############################################################################
 # Script du tutoriel de nas-forum.com par Superthx
@@ -29,11 +40,6 @@ Choix="all"
 #Fichier personnel facultatif listant des IP (1 par ligne) à bloquer
 Filtre_Perso="filtreperso.txt"
 
-# Pour trace facultative des IP non conformes au format IP v4 ou v6
-#Choix: {0}: sans trace, {1}: dans fichier log, {2}: dans fichier spécifique
-Trace_Ano=1
-File_Ano="anoip.txt" # à renseigner si option2 (sinon ne pas supprimer)
-
 ###############################################################################
 ###############################################################################
 ### CONSTANTES ###
@@ -44,6 +50,8 @@ dirtmp="/tmp/autoblock_synology"
 tmp1="${dirtmp}/fichiertemp1"
 tmp2="${dirtmp}/fichiertemp2"
 marge=60
+
+LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
 
 ###############################################################################
 ### FONCTIONS ###
@@ -96,16 +104,6 @@ EOL
 }
 
 ###############################################################################
-raz_fil_ano(){
-if [ -f  $File_Ano ]; then
-    rm  $File_Ano
-fi
-if [[ $Trace_Ano == 2 ]]; then
-    echo -e "\nDemarrage du script $version: $(date)" > $File_Ano
-fi
-}
-
-###############################################################################
 acquisition_ip(){
 if [ -f  $Filtre_Perso ];then
     cat "$Filtre_Perso" > $tmp1
@@ -130,7 +128,7 @@ for url in $Liste_Url; do
             done
 			;;
 	    
-        raw.githubusercontent.com)
+        raw.githubusercontent.com|blocklist.greensnow.co|cinsarmy.com)
             wget -q "$url" -O $tmp2
             nb=$(wc -l $tmp2 | cut -d' ' -f1)
             if [[ $nb -gt 0 ]];then
@@ -140,34 +138,6 @@ for url in $Liste_Url; do
             fi
             ;;
 
-        blocklist.greensnow.co)
-            wget -q "$url" -O $tmp2
-            nb=$(wc -l $tmp2 | cut -d' ' -f1)
-            if [[ $nb -gt 0 ]];then
-                sort -ufo $tmp1 $tmp2 $tmp1
-             else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-            ;;
-
-        cinsarmy.com)
-            wget -q "$url" -O $tmp2
-            nb=$(wc -l $tmp2 | cut -d' ' -f1)
-            if [[ $nb -gt 0 ]];then
-                sort -ufo $tmp1 $tmp2 $tmp1
-             else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-            ;;
-        reserve)
-	        wget -q "$url" -O $tmp2
-			nb=$(wc -l $tmp2 | cut -d' ' -f1)
-			if [[ $nb -gt 0 ]];then
-			    sort -ufo $tmp1 $tmp2 $tmp1
-			 else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-			;;
 	    *)
 			echo "Le traitement pour $url n'est pas implanté"
 			nb=0
@@ -189,7 +159,7 @@ EOL
 drop table if exists Tmp;
 create table Tmp (IP varchar(50) primary key);
 .mode csv
-.import /tmp/autoblock_synology/fichiertemp1 Tmp
+.import ${tmp1} Tmp
 alter table Tmp add column ExpireTime date;
 alter table Tmp add column Old boolean;
 update Tmp set ExpireTime = (select value from Var where name = 'stop');
@@ -200,20 +170,9 @@ select ExpireTime from Tmp where AutoBlockIP.IP = Tmp.IP and Tmp.Old = 1)
 where exists (
 select ExpireTime from Tmp where AutoBlockIP.IP = Tmp.IP and Tmp.Old = 1);
 delete from Tmp where Old = 1;
-drop table  Var;
+drop table Var;
 EOL
 rm $tmp1
-}
-
-###############################################################################
-tracer_ip_incorrecte(){
-case $Trace_Ano in
-    1)  echo "$nb_invalide:IP non traitée (format IP incorrect):  $ip"
-        ;;
-    2)  echo "$nb_invalide : $ip" >> $File_Ano               
-        ;;
-    *) ;;
-esac
 }
 
 ###############################################################################
@@ -246,7 +205,7 @@ if [[ $ip != '' ]]; then
             $(hex_en_dec $1) $(hex_en_dec $2) $(hex_en_dec $3) $(hex_en_dec $4) \
             $(hex_en_dec $5) $(hex_en_dec $6) $(hex_en_dec $7) $(hex_en_dec $8))
     else
-        tracer_ip_incorrecte
+        $S_LOG -s warn -d $S_NAME -d "${relay_name}" "IP non traitée (format IP incorrect): $ip"
     fi
     if [[ $ipstd != '' ]]; then 
         printf '%s,%s,%s,%s\n' "$ip" "$start" "$block_off" "$ipstd" >> $tmp1
@@ -261,7 +220,7 @@ drop table Tmp;
 create table Tmp (IP varchar(50) primary key, RecordTime date, 
 ExpireTime date, IPStd varchar(50));
 .mode csv
-.import /tmp/autoblock_synology/fichiertemp1 Tmp
+.import ${tmp1} Tmp
 EOL
 }
 
@@ -307,8 +266,7 @@ fi
 ##############
 cd `dirname $0`
 tests_initiaux $1
-plage_blocage
-raz_fil_ano 
+plage_blocage 
 acquisition_ip
 maj_ip_connues
 insertion_nouvelles_ip 
