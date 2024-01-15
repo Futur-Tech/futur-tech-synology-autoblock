@@ -1,40 +1,16 @@
 #!/bin/sh
 
-export LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
-source /usr/local/etc/autoblocksynology.conf
-source /usr/local/bin/futur-tech-synology-autoblock/ft_util_inc_var
-
-if [ "$(whoami)" != "root" ] ; then $S_LOG -s crit -d $S_NAME "Please run as root! You are only \"$(whoami)\"." ; exit 2 ; fi
-if [ -z "$1" ] ; then
-    $S_LOG -s crit -d $S_NAME "\$1 is empty..." ; echo "Usage: $0 <client-hostname>" ; exit 1
-else
-    client_host="$1"
-fi
-
 ###############################################################################
 # Script from the tutorial on nas-forum.com by Superthx
 ###############################################################################
 # This script accepts one parameter:  "raz"
 # If it is present, the script starts by deleting the IPs not permanently blocked
 
+export LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
+source /usr/local/etc/autoblocksynology.conf
+source /usr/local/bin/futur-tech-synology-autoblock/ft_util_inc_var
 
-# Indicate the frequency of running this script in hours
-Freq="1" 
-
-# Addresses of source sites separated by a space
-List_Urls="https://lists.blocklist.de/lists/ \
-https://blocklist.greensnow.co/greensnow.txt \ 
-https://cinsarmy.com/list/ci-badguys.txt \
-https://raw.githubusercontent.com/Futur-Tech/futur-tech-niflheim/main/nidhogg_ipv4.txt"
-
-# Pour la liste de www.blocklist.de
-# Liste de choix: {all} {ssh} {mail} {apache} {imap} {ftp} {sip} {bots}
-#              {strongips} {ircbot} {bruteforcelogin}
-#Choix séparés par un espace, exemple  "ssh apache bruteforcelogin"
-Choix="all"
-
-#Fichier personnel facultatif listant des IP (1 par ligne) à bloquer
-Personal_Filter="filtreperso.txt"
+if [ "$(whoami)" != "root" ] ; then $S_LOG -s crit -d $S_NAME "Please run as root! You are only \"$(whoami)\"." ; exit 2 ; fi
 
 version="v0.0.3"
 db="/etc/synoautoblock.db"
@@ -99,14 +75,14 @@ for url in $List_Urls; do
     case $host in
         lists.blocklist.de)
             nb=0
-            for chx in $Choix; do
+            for chx in $BlocklistDE_choice; do
                 wget -q "$url$chx.txt" -O $temp_file2
                 nb2=$(wc -l $temp_file2 | cut -d' ' -f1)
                 if [[ $nb2 -gt 0 ]];then
                         sort -ufo $temp_file1 $temp_file2 $temp_file1
                     nb=$(($nb+$nb2))
                 else
-                    $S_LOG -s err -d $S_NAME "Failed to load IPs from the site $host$choix.txt"
+                    $S_LOG -s err -d $S_NAME "Failed to load IPs from the site $host$BlocklistDE_choice.txt"
                 fi
             done
             ;;
