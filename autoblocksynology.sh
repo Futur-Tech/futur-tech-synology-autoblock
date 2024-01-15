@@ -16,7 +16,10 @@ Freq="1"
 
 # Adresses des sites source séparées par un espace
 Liste_Url="https://lists.blocklist.de/lists/ \
-https://mariushosting.com/wp-content/uploads/2018/07/deny-ip-list.txt"
+https://blocklist.greensnow.co/greensnow.txt \ 
+https://cinsarmy.com/list/ci-badguys.txt \
+https://raw.githubusercontent.com/Futur-Tech/futur-tech-niflheim/main/nidhogg_ipv4.txt"
+
 # Pour la liste de www.blocklist.de
 # Liste de choix: {all} {ssh} {mail} {apache} {imap} {ftp} {sip} {bots}
 #              {strongips} {ircbot} {bruteforcelogin}
@@ -35,11 +38,11 @@ File_Ano="anoip.txt" # à renseigner si option2 (sinon ne pas supprimer)
 ###############################################################################
 ### CONSTANTES ###
 ##################
-Version="v0.0.2"
+version="v0.0.3"
 db="/etc/synoautoblock.db"
 dirtmp="/tmp/autoblock_synology"
-filetemp1="/fichiertemp1"
-filetemp2="/fichiertemp2"
+tmp1="${dirtmp}/fichiertemp1"
+tmp2="${dirtmp}/fichiertemp2"
 marge=60
 
 ###############################################################################
@@ -53,7 +56,7 @@ EOL
 
 ###############################################################################
 tests_initiaux(){
-echo -e "\nDemarrage du script `basename $0` $Version: $(date)"
+echo -e "\nDemarrage du script `basename $0` $version: $(date)"
 if [ -f  "/bin/bash" ]; then
     TypeShell="bash"
 elif [ -f  "/bin/sh" ]; then    
@@ -98,14 +101,12 @@ if [ -f  $File_Ano ]; then
     rm  $File_Ano
 fi
 if [[ $Trace_Ano == 2 ]]; then
-    echo -e "\nDemarrage du script $Version: $(date)" > $File_Ano
+    echo -e "\nDemarrage du script $version: $(date)" > $File_Ano
 fi
 }
 
 ###############################################################################
 acquisition_ip(){
-tmp1=${dirtmp}${filetemp1}
-tmp2=${dirtmp}${filetemp2}
 if [ -f  $Filtre_Perso ];then
     cat "$Filtre_Perso" > $tmp1
 else
@@ -128,32 +129,37 @@ for url in $Liste_Url; do
                 fi
             done
 			;;
-	    mariushosting.com)
-		    if [[ $TypeShell == "bash" ]];then
-		        an_mois=$(date '+%Y/%m')
-		    elif [[ $TypeShell == "sh" ]];then
-		        an_mois=$(busybox date -D '%s' +"%Y/%m")
-		    fi
-		    wget -q ${url:0:45}$an_mois${url:52} -O $tmp2
-		    nb=$(wc -l  $tmp2 | cut -d' ' -f1)
-			if [[ $nb -gt 0 ]];then
+	    
+        raw.githubusercontent.com)
+            wget -q "$url" -O $tmp2
+            nb=$(wc -l $tmp2 | cut -d' ' -f1)
+            if [[ $nb -gt 0 ]];then
                 sort -ufo $tmp1 $tmp2 $tmp1
-            else
-		        if [[ $TypeShell == "bash" ]];then
-		            an_mois=$(date '+%Y/%m' -d "$start_date-7 days")
-                elif [[ $TypeShell == "sh" ]];then
-		            an_mois=$(busybox date -D '%s' +"%Y/%m" -d "$((`busybox date +%s`-86400*7))")
-		        fi
-		        wget -q ${url:0:45}$an_mois${url:52} -O $tmp2
-		        nb=$(wc -l  $tmp2 | cut -d' ' -f1)
-			    if [[ $nb -gt 0 ]];then
-		            sort -ufo  $tmp1 $tmp2 $tmp1
-                else
-		            echo "Echec chargement IP depuis le site $host"
-		        fi    
-		    fi
+             else
+                echo "Echec chargement IP depuis le site $host"
+            fi
             ;;
-	    reserve)
+
+        blocklist.greensnow.co)
+            wget -q "$url" -O $tmp2
+            nb=$(wc -l $tmp2 | cut -d' ' -f1)
+            if [[ $nb -gt 0 ]];then
+                sort -ufo $tmp1 $tmp2 $tmp1
+             else
+                echo "Echec chargement IP depuis le site $host"
+            fi
+            ;;
+
+        cinsarmy.com)
+            wget -q "$url" -O $tmp2
+            nb=$(wc -l $tmp2 | cut -d' ' -f1)
+            if [[ $nb -gt 0 ]];then
+                sort -ufo $tmp1 $tmp2 $tmp1
+             else
+                echo "Echec chargement IP depuis le site $host"
+            fi
+            ;;
+        reserve)
 	        wget -q "$url" -O $tmp2
 			nb=$(wc -l $tmp2 | cut -d' ' -f1)
 			if [[ $nb -gt 0 ]];then
@@ -282,7 +288,6 @@ EOL
 ###############################################################################
 insertion_nouvelles_ip(){
 newip=`sqlite3 $db "select IP from Tmp where IP <>''"`
-tmp1=${dirtmp}${filetemp1}
 for ip in $newip; do
    maj_ipstd
 done
@@ -307,6 +312,6 @@ raz_fil_ano
 acquisition_ip
 maj_ip_connues
 insertion_nouvelles_ip 
-echo  "Script terminé"		   
+echo "Script terminé"		   
 exit 0
 ###############################################################################
