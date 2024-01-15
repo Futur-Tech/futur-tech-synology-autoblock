@@ -1,317 +1,245 @@
 #!/bin/sh
 
 ###############################################################################
+# Script from the tutorial on nas-forum.com by Superthx
 ###############################################################################
-# Script du tutoriel de nas-forum.com par Superthx
-###############################################################################
-# Ce script accepte un paramètre:  "raz"
-# S'il est présent:
-# le script débute par la suppression des IP non bloquées définitivement
-###############################################################################
-### PARAMETRAGE ###
-###################
-# Indiquer la fréquence de lancement de ce script en heures
-#(exemples: 1 si chaque heure, 24 si journalier)
-Freq="1" 
+# This script accepts one parameter:  "reset"
+# If it is present, the script starts by deleting the IPs not permanently blocked
 
-# Adresses des sites source séparées par un espace
-Liste_Url="https://lists.blocklist.de/lists/ \
-https://blocklist.greensnow.co/greensnow.txt \ 
-https://cinsarmy.com/list/ci-badguys.txt \
-https://raw.githubusercontent.com/Futur-Tech/futur-tech-niflheim/main/nidhogg_ipv4.txt"
+export LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
+source /usr/local/etc/autoblocksynology.conf
+source /usr/local/bin/futur-tech-synology-autoblock/ft_util_inc_var
 
-# Pour la liste de www.blocklist.de
-# Liste de choix: {all} {ssh} {mail} {apache} {imap} {ftp} {sip} {bots}
-#              {strongips} {ircbot} {bruteforcelogin}
-#Choix séparés par un espace, exemple  "ssh apache bruteforcelogin"
-Choix="all"
+if [ "$(whoami)" != "root" ] ; then $S_LOG -s crit -d $S_NAME "Please run as root! You are only \"$(whoami)\"." ; exit 2 ; fi
 
-#Fichier personnel facultatif listant des IP (1 par ligne) à bloquer
-Filtre_Perso="filtreperso.txt"
-
-# Pour trace facultative des IP non conformes au format IP v4 ou v6
-#Choix: {0}: sans trace, {1}: dans fichier log, {2}: dans fichier spécifique
-Trace_Ano=1
-File_Ano="anoip.txt" # à renseigner si option2 (sinon ne pas supprimer)
-
-###############################################################################
-###############################################################################
-### CONSTANTES ###
-##################
 version="v0.0.3"
 db="/etc/synoautoblock.db"
-dirtmp="/tmp/autoblock_synology"
-tmp1="${dirtmp}/fichiertemp1"
-tmp2="${dirtmp}/fichiertemp2"
-marge=60
+temp_file="/tmp/futur-tech-synology-autoblock.tmp"
 
-###############################################################################
-### FONCTIONS ###
-#################
-raz_ip_bloquees(){
-sqlite3 $db <<EOL
-delete from AutoBlockIP where DENY = 1 and ExpireTime > 0;
-EOL
+# This function deletes all IP addresses from the AutoBlockIP table in the database
+# that are marked for denial (DENY = 1) but are not permanently blocked (ExpireTime > 0).
+ResetBlockedIPs(){
+    sqlite3 $db "DELETE FROM AutoBlockIP WHERE DENY = 1 AND ExpireTime > 0;"
 }
 
-###############################################################################
-tests_initiaux(){
-echo -e "\nDemarrage du script `basename $0` $version: $(date)"
+# This function sets up the blocking period by calculating the time to stop blocking
+# based on the current time, frequency of update (Update_Freq), plus a margin. It updates the 'Var' table in the database
+# with the calculated stop time.
+BlockingPeriodSetup(){
+    start=$(date +%s)
+    block_off=$((start + Update_Freq * 3 * 3600 + 600)) # * 3 is in case the list failed to download, there are 2 more try before being automatically expired. "+600" is to add an extra 10min margin.
+
+    # Dropping the 'Var' table if it exists and creating it again
+    sqlite3 $db "
+        DROP TABLE IF EXISTS Var;
+        CREATE TABLE Var (name TEXT PRIMARY KEY, value TEXT);"
+
+    # Inserting 'stop' value into 'Var' table
+    sqlite3 $db "INSERT INTO Var VALUES ('stop', $block_off)"
+}
+
+# This function fetches IP addresses from a given URL, filters out comments,
+# and logs the number of IPs loaded or any failure in loading.
+FetchIPsFromURL(){
+    local url=$1
+    local fetched_ips
+
+    # Fetch IPs and filter out comments
+    fetched_ips=$(wget -qO- "$url" | grep -v "^#")
+
+    # Check if IPs are fetched successfully
+    if [ -n "$fetched_ips" ]; then
+        all_fetched_ips+=$'\n'"$fetched_ips"
+        $S_LOG -s debug -d $S_NAME "Loaded $(echo "$fetched_ips" | wc -l) IPs from the URL $url"
+    else
+        $S_LOG -s err -d $S_NAME "Failed to load IPs from the URL $url"
+    fi
+}
+
+
+# This function fetches IP addresses from specified URLs (List_Urls) and the personal filter file.
+# It processes each URL, downloads the list of IPs, and merges them into a temporary file.
+FetchIPs(){
+    local all_fetched_ips=$(cat /usr/local/etc/autoblocksynology-extra-ip.txt) # personal filter file
+
+    for url in $List_Urls; do
+        host=$(echo $url | sed -n "s/^https\?:\/\/\([^/]\+\).*$/\1/p")
+        case $host in
+            lists.blocklist.de)
+                for chx in $BlocklistDE_choice; do
+                    FetchIPsFromURL "$url$chx.txt"
+                done
+                ;;
+
+            raw.githubusercontent.com|blocklist.greensnow.co|cinsarmy.com)
+                FetchIPsFromURL "$url"
+                ;;
+
+            *)
+                $S_LOG -s err -d $S_NAME "Processing for $url is not implemented"
+                ;;
+        esac
+    done
+
+    # Remove duplicates and store the result
+    echo "$all_fetched_ips" | grep -v "^#" | sort -u -f -o $temp_file
+
+    ## debug
+    # head -n 2000 "$temp_file" > "${temp_file}_tmp" && mv "${temp_file}_tmp" "$temp_file"
+
+    $S_LOG -d $S_NAME "Total loaded IPs: $(wc -l "$temp_file")"
+
+}
+
+# This function updates the known IP addresses in the database. It imports the IPs from the temporary file
+# into a temporary table in the database, sets their expiration time, and updates the AutoBlockIP table
+# with these new values. Finally, it cleans up the temporary table.
+UpdateKnownIPs(){
+
+    # Dropping and creating the 'Var' table
+    sqlite3 $db "
+        DROP TABLE IF EXISTS Var;
+        CREATE TABLE Var (name TEXT PRIMARY KEY, value TEXT);"
+
+    # Inserting the 'stop' value into the 'Var' table
+    sqlite3 $db "INSERT INTO Var VALUES ('stop', $block_off)"
+
+    # Processing the temporary file and updating the database
+    sqlite3 $db "
+        DROP TABLE IF EXISTS Tmp;
+        CREATE TABLE Tmp (IP VARCHAR(50) PRIMARY KEY);"
+
+    # Importing the CSV data into the Tmp table
+    sqlite3 $db <<EOF
+.mode csv
+.import ${temp_file} Tmp
+EOF
+
+    sqlite3 $db "
+        ALTER TABLE Tmp ADD COLUMN ExpireTime DATE;
+        ALTER TABLE Tmp ADD COLUMN Old BOOLEAN;
+        UPDATE Tmp SET ExpireTime = (SELECT value FROM Var WHERE name = 'stop');
+        UPDATE Tmp SET Old = (SELECT 1 FROM AutoBlockIP WHERE Tmp.IP = AutoBlockIP.IP);
+        UPDATE AutoBlockIP SET ExpireTime = (SELECT ExpireTime FROM Tmp WHERE AutoBlockIP.IP = Tmp.IP AND Tmp.Old = 1) WHERE EXISTS (SELECT ExpireTime FROM Tmp WHERE AutoBlockIP.IP = Tmp.IP AND Tmp.Old = 1);
+        DELETE FROM Tmp WHERE Old = 1;
+        DROP TABLE Var;"
+
+    rm $temp_file # Cleans up the temporary file
+}
+
+# A utility function that converts a hexadecimal number (passed as a parameter) into its decimal equivalent.
+HexToDec(){
+if [ "$1" != "" ]; then
+    printf "%d" "$(( 0x$1 ))"
+fi
+}
+
+# This function standardizes the format of IP addresses. It converts IPv4 addresses to a standard format
+# and handles IPv6 addresses, ensuring they are in the correct format for processing and storage.
+StandardizeIPFormat(){
+    local ip_addr="$1"
+    local ipstd=''
+
+    if [[ -z "$ip_addr" ]]; then
+        return
+    fi
+
+    if [[ $ip_addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipstd=$(printf "0000:0000:0000:0000:0000:FFFF:%02X%02X:%02X%02X" ${ip_addr//./' '})
+    elif [[ $ip_addr =~ : ]]; then
+        local ip6=${ip_addr//::/"$(echo ":::::::::" | sed "s/${ip_addr//[^:]/}/:0/g")"}
+        ip6=${ip6//:/ }
+        ipstd=$(printf "%04X:%04X:%04X:%04X:%04X:%04X:%04X:%04X" $(HexToDec ${ip6}))
+    else
+        $S_LOG -s warn -d $S_NAME "IP not processed (incorrect IP format): $ip_addr"
+        return
+    fi
+
+    if [[ -n "$ipstd" ]]; then 
+        formatted_ips+="${ip_addr},${start},${block_off},${ipstd}"$'\n'
+        # echo $ip_addr
+    fi
+}
+
+# This function is specific for NAS systems. It inserts the new IP addresses into the AutoBlockIP table.
+InsertNewIPsNAS(){
+    # Inserting data into the AutoBlockIP table from the 'Tmp' table
+    sqlite3 $db "INSERT INTO AutoBlockIP SELECT IP, RecordTime, ExpireTime, 1, IPStd, NULL, NULL FROM Tmp WHERE IPStd IS NOT NULL;"
+
+    # Dropping the 'Tmp' table
+    sqlite3 $db "DROP TABLE Tmp;"
+}
+
+# Similar to InsertNewIPsNAS, this function inserts new IP addresses into the AutoBlockIP table.
+InsertNewIPsRouter(){
+    # Inserting data into the AutoBlockIP table from the 'Tmp' table
+    sqlite3 $db "INSERT INTO AutoBlockIP SELECT IP, RecordTime, ExpireTime, 1, IPStd FROM Tmp WHERE IPStd IS NOT NULL;"
+
+    # Dropping the 'Tmp' table
+    sqlite3 $db "DROP TABLE Tmp;"
+}
+
+# This function orchestrates the process of inserting new IPs. It standardizes the format of each new IP
+# and then decides whether to call InsertNewIPsNAS or InsertNewIPsRouter based on the shell type.
+InsertNewIPs(){
+    newip="$(sqlite3 $db "SELECT IP FROM Tmp WHERE IP <>''")"
+    
+    if [ -z "$newip" ]; then
+        $S_LOG -d $S_NAME "No new IPs to process"
+    else
+        $S_LOG -d $S_NAME "Processing $(echo "$newip" | wc -l) new IPs"
+
+        formatted_ips=""  # Global variable to store formatted IPs
+        for ip in $newip; do StandardizeIPFormat "$ip" ; done
+        echo "$formatted_ips" | head -n -1 > $temp_file
+
+        if [ -f $temp_file ]; then
+            # Dropping the 'Tmp' table if it exists and creating it again
+            sqlite3 $db "
+                DROP TABLE IF EXISTS Tmp;
+                CREATE TABLE Tmp (IP VARCHAR(50) PRIMARY KEY, RecordTime DATE, ExpireTime DATE, IPStd VARCHAR(50));
+                "
+
+            # Importing data from the temporary file into the 'Tmp' table
+            sqlite3 $db <<EOF
+.mode csv
+.import ${temp_file} Tmp
+EOF
+
+            if [[ $TypeShell == "bash" ]];then
+                InsertNewIPsNAS
+            elif [[ $TypeShell == "sh" ]];then
+                InsertNewIPsRouter
+            fi    
+            rm $temp_file # Cleans up the temporary file
+        fi
+    fi
+
+}
+
+$S_LOG -d $S_NAME "Starting the script `basename $0` $version"
 if [ -f  "/bin/bash" ]; then
     TypeShell="bash"
 elif [ -f  "/bin/sh" ]; then    
     TypeShell="sh"
 else
-    echo -e "Erreur dans le script\nAbandon du script"
+    $S_LOG -s crit -d $S_NAME "Exiting script"
     exit 1
 fi
 if [[ $# -gt 0 ]]; then
-    if [[ "$1" == "raz" ]]; then
-        raz_ip_bloquees
-        echo "Le blocage des IP non bloquées définitivement a été supprimé"
+    if [[ "$1" == "reset" ]]; then
+        ResetBlockedIPs
+        $S_LOG -d $S_NAME "The blocking of IPs not blocked permanently has been removed."
     else
-        echo -e "Parametre $1 incorrect!\nSeul parametre autorisé: 'raz'"
-        echo "Abandon du script"
+        $S_LOG -s crit -d $S_NAME "Incorrect parameter $1! Only allowed parameter: 'reset'"
+        $S_LOG -s crit -d $S_NAME "Exiting script"
         exit 1
     fi
 fi
-if [ ! -d  "/tmp" ]; then  # par sécurité
-    echo   -e "Le dossier tmp n'existe pas\nAbandon du script" # par sécurité
-    exit 1 # par sécurité
-elif [ ! -d  $dirtmp ]; then
-    mkdir $dirtmp
-    chmod 755 $dirtmp
-fi
-}
 
-###############################################################################
-plage_blocage(){
-start=`date +%s`
-block_off=$((start+Freq*2*3600+$marge))
-sqlite3 $db <<EOL
-drop table if exists Var;
-create table Var (name text primary key, value text);
-EOL
-`sqlite3 $db "insert into Var values ('stop', $block_off)"`
-}
-
-###############################################################################
-raz_fil_ano(){
-if [ -f  $File_Ano ]; then
-    rm  $File_Ano
-fi
-if [[ $Trace_Ano == 2 ]]; then
-    echo -e "\nDemarrage du script $version: $(date)" > $File_Ano
-fi
-}
-
-###############################################################################
-acquisition_ip(){
-if [ -f  $Filtre_Perso ];then
-    cat "$Filtre_Perso" > $tmp1
-else
-    touch $tmp1
-    touch $Filtre_Perso
-fi
-for url in $Liste_Url; do
-	host=`echo $url | sed -n "s/^https\?:\/\/\([^/]\+\).*$/\1/p"`
-	case $host in
-		lists.blocklist.de)
-			nb=0
-			for chx in $Choix; do
-			    wget -q "$url$chx.txt" -O $tmp2
-			    nb2=$(wc -l $tmp2 | cut -d' ' -f1)
-			    if [[ $nb2 -gt 0 ]];then
-			        sort -ufo $tmp1 $tmp2 $tmp1
-			        nb=$(($nb+$nb2))
-			    else
-                    echo "Echec chargement IP depuis le site $host$choix.txt"
-                fi
-            done
-			;;
-	    
-        raw.githubusercontent.com)
-            wget -q "$url" -O $tmp2
-            nb=$(wc -l $tmp2 | cut -d' ' -f1)
-            if [[ $nb -gt 0 ]];then
-                sort -ufo $tmp1 $tmp2 $tmp1
-             else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-            ;;
-
-        blocklist.greensnow.co)
-            wget -q "$url" -O $tmp2
-            nb=$(wc -l $tmp2 | cut -d' ' -f1)
-            if [[ $nb -gt 0 ]];then
-                sort -ufo $tmp1 $tmp2 $tmp1
-             else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-            ;;
-
-        cinsarmy.com)
-            wget -q "$url" -O $tmp2
-            nb=$(wc -l $tmp2 | cut -d' ' -f1)
-            if [[ $nb -gt 0 ]];then
-                sort -ufo $tmp1 $tmp2 $tmp1
-             else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-            ;;
-        reserve)
-	        wget -q "$url" -O $tmp2
-			nb=$(wc -l $tmp2 | cut -d' ' -f1)
-			if [[ $nb -gt 0 ]];then
-			    sort -ufo $tmp1 $tmp2 $tmp1
-			 else
-                echo "Echec chargement IP depuis le site $host"
-            fi
-			;;
-	    *)
-			echo "Le traitement pour $url n'est pas implanté"
-			nb=0
-			;;
-	esac
-done
-rm $tmp2
-nb_ligne=$(wc -l  $tmp1 | cut -d' ' -f1)						
-}
-
-###############################################################################
-maj_ip_connues(){
-sqlite3 $db <<EOL
-drop table if exists Var;
-create table Var (name text primary key, value text);
-EOL
-`sqlite3 $db "insert into Var values ('stop', $block_off)"
-`sqlite3 $db <<EOL
-drop table if exists Tmp;
-create table Tmp (IP varchar(50) primary key);
-.mode csv
-.import /tmp/autoblock_synology/fichiertemp1 Tmp
-alter table Tmp add column ExpireTime date;
-alter table Tmp add column Old boolean;
-update Tmp set ExpireTime = (select value from Var where name = 'stop');
-update Tmp set Old = (
-select 1 from AutoBlockIP where Tmp.IP = AutoBlockIP.IP);
-update AutoBlockIP set ExpireTime=(
-select ExpireTime from Tmp where AutoBlockIP.IP = Tmp.IP and Tmp.Old = 1) 
-where exists (
-select ExpireTime from Tmp where AutoBlockIP.IP = Tmp.IP and Tmp.Old = 1);
-delete from Tmp where Old = 1;
-drop table  Var;
-EOL
-rm $tmp1
-}
-
-###############################################################################
-tracer_ip_incorrecte(){
-case $Trace_Ano in
-    1)  echo "$nb_invalide:IP non traitée (format IP incorrect):  $ip"
-        ;;
-    2)  echo "$nb_invalide : $ip" >> $File_Ano               
-        ;;
-    *) ;;
-esac
-}
-
-###############################################################################
-hex_en_dec(){
-if [ "$1" != "" ];then
-    printf "%d" "$(( 0x$1 ))"
-fi
-}
-
-###############################################################################
-maj_ipstd(){
-ipstd=''
-if [[ $ip != '' ]]; then
-    if expr "$ip" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' > \
-        /dev/null; then
-        ipstd=$(printf "0000:0000:0000:0000:0000:FFFF:%02X%02X:%02X%02X" \
-            ${ip//./' '})
-    elif [[ $ip != "${1#*:[0-9a-fA-F]}" ]]; then
-        ip6=$ip
-        echo $ip6 | grep -qs "^:" && $ip6="0${ip6}"
-        if echo $ip6 | grep -qs "::"; then
-            sep=$(echo $ip6 | sed 's/[^:]//g')
-            absent=$(echo ":::::::::" | sed "s/$sep//")
-            rempl=$(echo $absent | sed 's/:/:0/g')
-            ip6=$(echo $ip6 | sed "s/::/$rempl/")
-        fi
-        blocks=$(echo $ip6 | grep -o "[0-9a-f]\+")
-        set $blocks
-        ipstd=$(printf "%04X:%04X:%04X:%04X:%04X:%04X:%04X:%04X" \
-            $(hex_en_dec $1) $(hex_en_dec $2) $(hex_en_dec $3) $(hex_en_dec $4) \
-            $(hex_en_dec $5) $(hex_en_dec $6) $(hex_en_dec $7) $(hex_en_dec $8))
-    else
-        tracer_ip_incorrecte
-    fi
-    if [[ $ipstd != '' ]]; then 
-        printf '%s,%s,%s,%s\n' "$ip" "$start" "$block_off" "$ipstd" >> $tmp1
-    fi
-fi
-}
-
-###############################################################################
-import_nouvelles_ip(){
-sqlite3 $db <<EOL
-drop table Tmp;
-create table Tmp (IP varchar(50) primary key, RecordTime date, 
-ExpireTime date, IPStd varchar(50));
-.mode csv
-.import /tmp/autoblock_synology/fichiertemp1 Tmp
-EOL
-}
-
-###############################################################################
-insertion_nouvelles_ip_nas(){
-sqlite3 $db <<EOL
-insert into AutoBlockIP 
-select IP, RecordTime, ExpireTime, 1, IPStd, NULL, NULL 
-from Tmp where IPStd is not NULL;
-drop table Tmp;
-EOL
-}
-
-###############################################################################
-insertion_nouvelles_ip_routeur(){
-sqlite3 $db <<EOL
-insert into AutoBlockIP 
-select IP, RecordTime, ExpireTime, 1, IPStd 
-from Tmp where IPStd is not NULL;
-drop table Tmp;
-EOL
-}
-
-###############################################################################
-insertion_nouvelles_ip(){
-newip=`sqlite3 $db "select IP from Tmp where IP <>''"`
-for ip in $newip; do
-   maj_ipstd
-done
-if [ -f  $tmp1 ]; then
-    import_nouvelles_ip
-    if [[ $TypeShell == "bash" ]];then
-        insertion_nouvelles_ip_nas
-	elif [[ $TypeShell == "sh" ]];then
-    	insertion_nouvelles_ip_routeur
-	fi    
-	rm $tmp1
-fi
-}
-
-###############################################################################
-### SCRIPT ###
-##############
-cd `dirname $0`
-tests_initiaux $1
-plage_blocage
-raz_fil_ano 
-acquisition_ip
-maj_ip_connues
-insertion_nouvelles_ip 
-echo "Script terminé"		   
+BlockingPeriodSetup 
+FetchIPs
+UpdateKnownIPs
+InsertNewIPs 
+$S_LOG -d $S_NAME "Script finished"
 exit 0
-###############################################################################
