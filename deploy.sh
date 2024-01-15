@@ -20,9 +20,16 @@ echo "
 
 mkdir_if_missing "${bin_dir}"
 
+if [ ! -d "${etc_dir}" ]; then
+  mkdir "${etc_dir}"
+  $S_LOG -s $? -d $S_NAME "Creating ${etc_dir} returned EXIT_CODE=$?"
+fi
+
 $S_DIR/ft-util/ft_util_file-deploy "$S_DIR/autoblocksynology.sh" "${bin_dir}/autoblocksynology.sh"
 $S_DIR/ft-util/ft_util_file-deploy "$S_DIR/ft-util/ft_util_log" "${bin_dir}/ft_util_log"
 $S_DIR/ft-util/ft_util_file-deploy "$S_DIR/ft-util/ft_util_inc_var" "${bin_dir}/ft_util_inc_var"
+
+$S_DIR/ft-util/ft_util_conf-update -s "$S_DIR/autoblocksynology.conf" -d "/usr/local/etc/autoblocksynology.conf"
 
 [ ! -e "/var/log/${app_name}.log" ] && touch /var/log/${app_name}.log
 
