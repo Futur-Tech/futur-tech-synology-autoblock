@@ -1,8 +1,8 @@
 #!/bin/sh
 
-export LOG_FILE="/var/log/futur-tech-relay-server.log"
-source /usr/local/etc/futur-tech-relay-server.conf
-source /usr/local/bin/futur-tech-relay-server/ft_util_inc_var
+export LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
+source /usr/local/etc/autoblocksynology.conf
+source /usr/local/bin/futur-tech-synology-autoblock/ft_util_inc_var
 
 if [ "$(whoami)" != "root" ] ; then $S_LOG -s crit -d $S_NAME "Please run as root! You are only \"$(whoami)\"." ; exit 2 ; fi
 if [ -z "$1" ] ; then
@@ -50,8 +50,6 @@ dirtmp="/tmp/autoblock_synology"
 tmp1="${dirtmp}/fichiertemp1"
 tmp2="${dirtmp}/fichiertemp2"
 marge=60
-
-LOG_FILE="/var/log/futur-tech-synology-autoblock.log"
 
 ###############################################################################
 ### FONCTIONS ###
@@ -175,14 +173,12 @@ EOL
 rm $tmp1
 }
 
-###############################################################################
 hex_en_dec(){
 if [ "$1" != "" ];then
     printf "%d" "$(( 0x$1 ))"
 fi
 }
 
-###############################################################################
 maj_ipstd(){
 ipstd=''
 if [[ $ip != '' ]]; then
@@ -213,7 +209,6 @@ if [[ $ip != '' ]]; then
 fi
 }
 
-###############################################################################
 import_nouvelles_ip(){
 sqlite3 $db <<EOL
 drop table Tmp;
@@ -224,7 +219,6 @@ ExpireTime date, IPStd varchar(50));
 EOL
 }
 
-###############################################################################
 insertion_nouvelles_ip_nas(){
 sqlite3 $db <<EOL
 insert into AutoBlockIP 
@@ -234,7 +228,6 @@ drop table Tmp;
 EOL
 }
 
-###############################################################################
 insertion_nouvelles_ip_routeur(){
 sqlite3 $db <<EOL
 insert into AutoBlockIP 
@@ -244,7 +237,6 @@ drop table Tmp;
 EOL
 }
 
-###############################################################################
 insertion_nouvelles_ip(){
 newip=`sqlite3 $db "select IP from Tmp where IP <>''"`
 for ip in $newip; do
@@ -261,9 +253,6 @@ if [ -f  $tmp1 ]; then
 fi
 }
 
-###############################################################################
-### SCRIPT ###
-##############
 cd `dirname $0`
 tests_initiaux $1
 plage_blocage 
@@ -272,4 +261,3 @@ maj_ip_connues
 insertion_nouvelles_ip 
 echo "Script terminé"		   
 exit 0
-###############################################################################
